@@ -342,6 +342,7 @@ def _process_dataset(filenames, synsets, labels, output_directory, prefix,
   coder = ImageCoder()
 
   pairs = list(zip(filenames, synsets))
+  random.seed(12345)
   random.shuffle(pairs)
   filenames, synsets = zip(*pairs)
 
