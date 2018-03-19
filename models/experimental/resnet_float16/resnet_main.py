@@ -359,7 +359,6 @@ def main(unused_argv):
   session_config = tf.ConfigProto(
       inter_op_parallelism_threads=0,
       intra_op_parallelism_threads=0,
-      log_device_placement=True,
       allow_soft_placement=True)
   
   run_config = tf.estimator.RunConfig().replace(save_checkpoints_secs=1e9,
@@ -394,71 +393,45 @@ def main(unused_argv):
   current_step = estimator._load_global_step_from_checkpoint_dir(FLAGS.model_dir)  # pylint: disable=protected-access,line-too-long
   start_timestamp = time.time()
   current_epoch = current_step // FLAGS.train_batch_size
+  batches_per_epoch = NUM_TRAIN_IMAGES // FLAGS.train_batch_size
+  results = []
 
-  if FLAGS.mode == 'train':
+  while current_epoch < 100:
+    next_checkpoint = (current_epoch + 1) * batches_per_epoch
+
     resnet_classifier.train(
-        input_fn=imagenet_train.input_fn, max_steps=FLAGS.train_steps)
+        input_fn=imagenet_train.input_fn, max_steps=next_checkpoint)
+    current_epoch += 1    
     training_time = time.time() - start_timestamp
-    tf.logging.info('Finished training in %d seconds' % training_time)
+    tf.logging.info('Finished training up to step %d. Elapsed seconds %d.' %
+                    (next_checkpoint, int(time.time() - start_timestamp)))
 
-    with tf.gfile.GFile(FLAGS.model_dir + '/total_time_%s.txt' % training_time, 'w') as f:  # pylint: disable=line-too-long
-      f.write('Total training time was %s seconds' % training_time)
-  elif FLAGS.mode == 'eval':
-    results = []
-    def terminate_eval():
-      tf.logging.info('Terminating eval after %d seconds of no checkpoints' %
-                      FLAGS.eval_timeout)
-      return True
+    # Evaluate the model on the most recent model in --model_dir.
+    # Since evaluation happens in batches of --eval_batch_size, some images may
+    # be excluded modulo the batch size. As long as the batch size is
+    # consistent, the evaluated images are also consistent.
+    tf.logging.info('Starting to evaluate.')
+    eval_results = resnet_classifier.evaluate(
+        input_fn=imagenet_eval.input_fn,
+        steps=NUM_EVAL_IMAGES // FLAGS.eval_batch_size)
+    tf.logging.info('Eval results: %s' % eval_results)
 
-    # Run evaluation when there's a new checkpoint
-    for ckpt in evaluation.checkpoints_iterator(
-        FLAGS.model_dir,
-        min_interval_secs=FLAGS.min_eval_interval,
-        timeout=FLAGS.eval_timeout,
-        timeout_fn=terminate_eval):
+    elapsed_time = int(time.time() - start_timestamp)
+    tf.logging.info('Finished epoch %s at %s time' % (
+        current_epoch, elapsed_time))
+    results.append([
+        current_epoch,
+        elapsed_time / 3600.0,
+        '{0:.2f}'.format(eval_results['accuracy']*100),
+        '{0:.2f}'.format(eval_results['accuracy']*100),
+    ])
 
-      tf.logging.info('Starting to evaluate.')
-      try:
-        eval_results = resnet_classifier.evaluate(
-            input_fn=imagenet_eval.input_fn,
-            steps=NUM_EVAL_IMAGES // FLAGS.eval_batch_size)
-        tf.logging.info('Eval results: %s' % eval_results)
+  with tf.gfile.GFile(FLAGS.model_dir + '/epoch_results.tsv', 'wb') as tsv_file:
+    writer = csv.writer(tsv_file, delimiter='\t')
+    writer.writerow(['epoch', 'hours', 'top1Accuracy', 'top5Accuracy'])
+    writer.writerows(results)
 
-        # Terminate eval job when final checkpoint is reached
-        current_step = int(os.path.basename(ckpt).split('-')[1])
-        current_epoch = current_step // FLAGS.iterations_per_loop
-        results.append([
-            current_epoch,
-            '{0:.2f}'.format(eval_results['Top-1 accuracy']*100),
-            '{0:.2f}'.format(eval_results['Top-5 accuracy']*100),
-        ])
 
-        if current_step >= FLAGS.train_steps:
-          tf.logging.info('Evaluation finished after training step %d' %
-                          current_step)
-          break
-
-      except tf.errors.NotFoundError:
-        # Since the coordinator is on a different job than the TPU worker,
-        # sometimes the TPU worker does not finish initializing until long after
-        # the CPU job tells it to start evaluating. In this case, the checkpoint
-        # file could have been deleted already.
-        tf.logging.info('Checkpoint %s no longer exists, skipping checkpoint' %
-                        ckpt)
-    with tf.gfile.GFile(FLAGS.model_dir + '/epoch_results.tsv', 'wb') as tsv_file:  # pylint: disable=line-too-long
-      writer = csv.writer(tsv_file, delimiter='\t')
-      writer.writerow(['epoch', 'top1Accuracy', 'top5Accuracy'])
-      writer.writerows(results)
-  else:
-    tf.logging.info('Mode not found.')
-
-  if FLAGS.export_dir is not None:
-    # The guide to serve a exported TensorFlow model is at:
-    #    https://www.tensorflow.org/serving/serving_basic
-    tf.logging.info('Starting to export model.')
-    resnet_classifier.export_savedmodel(
-        export_dir_base=FLAGS.export_dir,
-        serving_input_receiver_fn=imagenet_input.image_serving_input_fn)
 
 
 if __name__ == '__main__':
